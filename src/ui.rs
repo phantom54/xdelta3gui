@@ -1,9 +1,13 @@
-use crate::runner::{self, ProgressMsg};
+use crate::runner::{self, FileError, ProgressMsg};
 use crate::scan;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+const FORCE_CANCEL_DELAY: Duration = Duration::from_secs(5);
+const MAX_SHOWN_ERRORS: usize = 5;
 
 pub struct AppState {
     pub create_old: String,
@@ -17,11 +21,15 @@ pub struct AppState {
     pub is_running: bool,
     pub overall_progress: f32,
     pub current_file_name: String,
+    pub error_count: usize,
     pub cancel_flag: Arc<AtomicBool>,
+    pub current_pid: runner::CurrentPid,
     pub rx: Option<Receiver<ProgressMsg>>,
     pub show_cancel_dialog: bool,
     pub pending_cleanup_path: Option<PathBuf>,
     pub pending_cleanup_is_zip: bool,
+
+    pub cancel_started_at: Option<Instant>,
 }
 
 impl Default for AppState {
@@ -37,11 +45,14 @@ impl Default for AppState {
             is_running: false,
             overall_progress: 0.0,
             current_file_name: String::new(),
+            error_count: 0,
             cancel_flag: Arc::new(AtomicBool::new(false)),
+            current_pid: Arc::new(Mutex::new(None)),
             rx: None,
             show_cancel_dialog: false,
             pending_cleanup_path: None,
             pending_cleanup_is_zip: false,
+            cancel_started_at: None,
         }
     }
 }
@@ -49,6 +60,14 @@ impl Default for AppState {
 impl AppState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn reset_progress(&mut self) {
+        self.overall_progress = 0.0;
+        self.current_file_name.clear();
+        self.error_count = 0;
+        self.cancel_started_at = None;
+        self.cancel_flag.store(false, Ordering::Relaxed);
     }
 }
 
@@ -116,7 +135,7 @@ fn zip_open_picker(ui: &mut egui::Ui, label: &str, value: &mut String, enabled: 
 fn to_path(s: &str) -> Result<PathBuf, String> {
     let trimmed = s.trim().trim_matches('"');
     if trimmed.is_empty() {
-        return Err("Path is empty".into());
+        return Err("Error: Path is empty".into());
     }
     let p = PathBuf::from(trimmed);
     if p.is_absolute() {
@@ -145,6 +164,42 @@ fn is_inside(child: &PathBuf, parent: &PathBuf) -> bool {
     child_str.starts_with(&parent_str) && child_str != parent_str.trim_end_matches('\\')
 }
 
+fn check_no_nesting(a: &PathBuf, b: &PathBuf, a_name: &str, b_name: &str) -> Result<(), String> {
+    if is_inside(a, b) {
+        return Err(format!("Error: {} cannot be inside {}", a_name, b_name));
+    }
+    if is_inside(b, a) {
+        return Err(format!("Error: {} cannot be inside {}", b_name, a_name));
+    }
+    Ok(())
+}
+
+fn format_errors_for_status(errors: &[FileError], max_items: usize) -> String {
+    let sep = "\n──────────────\n";
+    let mut s = String::new();
+    let n = errors.len().min(max_items);
+    for (i, e) in errors.iter().take(n).enumerate() {
+        if i > 0 {
+            s.push_str(sep);
+        }
+        let lines: Vec<&str> = e
+            .details
+            .lines()
+            .map(|l| l.trim_end())
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+        if !lines.is_empty() {
+            s.push_str(lines[0]);
+            for l in &lines[1..] {
+                s.push('\n');
+                s.push_str("    ");
+                s.push_str(l);
+            }
+        }
+    }
+    s
+}
+
 pub fn draw(ui: &mut egui::Ui, state: &mut AppState) {
     ui.ctx().set_zoom_factor(1.5);
 
@@ -158,10 +213,14 @@ pub fn draw(ui: &mut egui::Ui, state: &mut AppState) {
                 ProgressMsg::Overall(prog) => {
                     state.overall_progress = prog;
                 }
+                ProgressMsg::ErrorCount(n) => {
+                    state.error_count = n;
+                }
                 ProgressMsg::Done(res) => {
                     done = true;
                     state.is_running = false;
                     state.current_file_name.clear();
+                    state.cancel_started_at = None;
                     match res {
                         Ok(_) => {
                             state.overall_progress = 1.0;
@@ -175,6 +234,22 @@ pub fn draw(ui: &mut egui::Ui, state: &mut AppState) {
                             }
                         }
                     }
+                }
+                ProgressMsg::DoneWithErrors { total_ops, errors } => {
+                    done = true;
+                    state.is_running = false;
+                    state.current_file_name.clear();
+                    state.cancel_started_at = None;
+                    state.overall_progress = 1.0;
+                    state.error_count = errors.len();
+                    let total_errors = errors.len();
+                    let shown = total_errors.min(MAX_SHOWN_ERRORS);
+                    let mut msg = format!(
+                        "Operation completed successfully ({}), with errors ({}), shown ({}):\n",
+                        total_ops, total_errors, shown
+                    );
+                    msg.push_str(&format_errors_for_status(&errors, MAX_SHOWN_ERRORS));
+                    state.status = msg;
                 }
             }
         }
@@ -223,12 +298,60 @@ pub fn draw(ui: &mut egui::Ui, state: &mut AppState) {
         ui.label(&state.status);
 
         if state.is_running {
-            ui.add(egui::ProgressBar::new(state.overall_progress).text("Overall Progress"));
+            let has_errors = state.error_count > 0;
+            let text = if has_errors {
+                format!("Overall Progress (errors: {})", state.error_count)
+            } else {
+                "Overall Progress".to_string()
+            };
+            let fill = if has_errors {
+                egui::Color32::from_rgb(180, 90, 20)
+            } else {
+                egui::Color32::from_rgb(0, 120, 215)
+            };
+            ui.add(
+                egui::ProgressBar::new(state.overall_progress)
+                    .text(text)
+                    .fill(fill),
+            );
             if !state.current_file_name.is_empty() {
                 ui.label(format!("Current: {}", state.current_file_name));
             }
-            if ui.button("Cancel").clicked() {
-                state.cancel_flag.store(true, Ordering::Relaxed);
+
+            match state.cancel_started_at {
+                None => {
+                    if ui.button("Cancel").clicked() {
+                        state.cancel_started_at = Some(Instant::now());
+                        state.cancel_flag.store(true, Ordering::Relaxed);
+                    }
+                }
+                Some(started) => {
+                    let elapsed = started.elapsed();
+                    if elapsed < FORCE_CANCEL_DELAY {
+                        let remaining =
+                            (FORCE_CANCEL_DELAY.as_secs_f32() - elapsed.as_secs_f32()).max(0.0);
+                        let _ = ui.add_enabled(
+                            false,
+                            egui::Button::new(format!("Cancel ({:.0})", remaining.ceil())),
+                        );
+                        ui.ctx()
+                            .request_repaint_after(Duration::from_millis(100));
+                    } else {
+                        if ui
+                            .add(
+                                egui::Button::new("Force Cancel")
+                                    .fill(egui::Color32::from_rgb(200, 60, 60)),
+                            )
+                            .clicked()
+                        {
+                            runner::force_kill_current(&state.current_pid);
+                            state.cancel_flag.store(true, Ordering::Relaxed);
+                            state.cancel_started_at = None;
+                        }
+                        ui.ctx()
+                            .request_repaint_after(Duration::from_millis(100));
+                    }
+                }
             }
         }
 
@@ -297,12 +420,17 @@ fn start_create(state: &mut AppState) {
         state.status = "Error: Old and New version folders must be different".into();
         return;
     }
-    if is_inside(&out, &old) {
-        state.status = "Error: Patch zip cannot be inside Old version folder".into();
+
+    if let Err(e) = check_no_nesting(&old, &new, "Old version folder", "New version folder") {
+        state.status = e;
         return;
     }
-    if is_inside(&out, &new) {
-        state.status = "Error: Patch zip cannot be inside New version folder".into();
+    if let Err(e) = check_no_nesting(&out, &old, "Patch zip", "Old version folder") {
+        state.status = e;
+        return;
+    }
+    if let Err(e) = check_no_nesting(&out, &new, "Patch zip", "New version folder") {
+        state.status = e;
         return;
     }
 
@@ -324,17 +452,17 @@ fn start_create(state: &mut AppState) {
     };
 
     state.is_running = true;
-    state.overall_progress = 0.0;
-    state.cancel_flag.store(false, Ordering::Relaxed);
+    state.reset_progress();
     state.pending_cleanup_path = Some(out.clone());
     state.pending_cleanup_is_zip = true;
 
     let (tx, rx) = std::sync::mpsc::channel();
     state.rx = Some(rx);
     let cancel = state.cancel_flag.clone();
+    let pid = state.current_pid.clone();
 
     std::thread::spawn(move || {
-        runner::create_patch(&old, &new, &out, &meta, &xdelta, tx, cancel);
+        runner::create_patch(&old, &new, &out, &meta, &xdelta, tx, cancel, pid);
     });
 }
 
@@ -365,6 +493,16 @@ fn start_apply(state: &mut AppState) {
         return;
     }
 
+    if let Err(e) = check_no_nesting(
+        &old,
+        &out,
+        "Old version folder",
+        "New version (empty) folder",
+    ) {
+        state.status = e;
+        return;
+    }
+
     let xdelta = match runner::ensure_xdelta_exe() {
         Ok(p) => p,
         Err(e) => {
@@ -374,16 +512,16 @@ fn start_apply(state: &mut AppState) {
     };
 
     state.is_running = true;
-    state.overall_progress = 0.0;
-    state.cancel_flag.store(false, Ordering::Relaxed);
+    state.reset_progress();
     state.pending_cleanup_path = Some(out.clone());
     state.pending_cleanup_is_zip = false;
 
     let (tx, rx) = std::sync::mpsc::channel();
     state.rx = Some(rx);
     let cancel = state.cancel_flag.clone();
+    let pid = state.current_pid.clone();
 
     std::thread::spawn(move || {
-        runner::apply_patch(&old, &out, &patch_zip, &xdelta, tx, cancel);
+        runner::apply_patch(&old, &out, &patch_zip, &xdelta, tx, cancel, pid);
     });
 }
