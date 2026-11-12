@@ -174,6 +174,16 @@ fn check_no_nesting(a: &PathBuf, b: &PathBuf, a_name: &str, b_name: &str) -> Res
     Ok(())
 }
 
+fn require_dir(p: &PathBuf, name: &str) -> Result<(), String> {
+    if !p.exists() {
+        return Err(format!("Error: {} does not exist: {}", name, p.display()));
+    }
+    if !p.is_dir() {
+        return Err(format!("Error: {} is not a folder: {}", name, p.display()));
+    }
+    Ok(())
+}
+
 fn format_errors_for_status(errors: &[FileError], max_items: usize) -> String {
     let sep = "\n──────────────\n";
     let mut s = String::new();
@@ -224,7 +234,7 @@ pub fn draw(ui: &mut egui::Ui, state: &mut AppState) {
                     match res {
                         Ok(_) => {
                             state.overall_progress = 1.0;
-                            state.status = "Operation completed successfully".into();
+                            state.status = "Operation completed".into();
                         }
                         Err(e) => {
                             if e == "Cancelled by user" {
@@ -245,7 +255,7 @@ pub fn draw(ui: &mut egui::Ui, state: &mut AppState) {
                     let total_errors = errors.len();
                     let shown = total_errors.min(MAX_SHOWN_ERRORS);
                     let mut msg = format!(
-                        "Operation completed successfully ({}), with errors ({}), shown ({}):\n",
+                        "Operation completed. Total {}, with errors {}, shown {}:\n",
                         total_ops, total_errors, shown
                     );
                     msg.push_str(&format_errors_for_status(&errors, MAX_SHOWN_ERRORS));
@@ -300,9 +310,9 @@ pub fn draw(ui: &mut egui::Ui, state: &mut AppState) {
         if state.is_running {
             let has_errors = state.error_count > 0;
             let text = if has_errors {
-                format!("Overall Progress (errors: {})", state.error_count)
+                format!("Progress (errors: {})", state.error_count)
             } else {
-                "Overall Progress".to_string()
+                "Progress".to_string()
             };
             let fill = if has_errors {
                 egui::Color32::from_rgb(180, 90, 20)
@@ -315,7 +325,7 @@ pub fn draw(ui: &mut egui::Ui, state: &mut AppState) {
                     .fill(fill),
             );
             if !state.current_file_name.is_empty() {
-                ui.label(format!("Current: {}", state.current_file_name));
+                ui.label(format!("{}", state.current_file_name));
             }
 
             match state.cancel_started_at {
@@ -412,6 +422,15 @@ fn start_create(state: &mut AppState) {
         Err(e) => { state.status = e; return; }
     };
 
+    if let Err(e) = require_dir(&old, "Old version folder") {
+        state.status = e;
+        return;
+    }
+    if let Err(e) = require_dir(&new, "New version folder") {
+        state.status = e;
+        return;
+    }
+
     if out.is_dir() {
         state.status = "Error: Patch output must be a .zip file path, not a folder".into();
         return;
@@ -434,14 +453,18 @@ fn start_create(state: &mut AppState) {
         return;
     }
 
+    let meta = scan::build_plan(&old, &new);
+    if meta.operations.is_empty() {
+        state.status = "Error: New version folder contains no files; nothing to patch".into();
+        return;
+    }
+
     if let Some(parent) = out.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             state.status = format!("Error creating output dir: {}", e);
             return;
         }
     }
-
-    let meta = scan::build_plan(&old, &new);
 
     let xdelta = match runner::ensure_xdelta_exe() {
         Ok(p) => p,
@@ -473,12 +496,6 @@ fn start_apply(state: &mut AppState) {
         Ok(p) => p,
         Err(e) => { state.status = e; return; }
     };
-
-    if !patch_zip.is_file() {
-        state.status = "Error: Patch path must point to an existing .zip file".into();
-        return;
-    }
-
     let old = match to_path(&state.apply_old) {
         Ok(p) => p,
         Err(e) => { state.status = e; return; }
@@ -488,6 +505,30 @@ fn start_apply(state: &mut AppState) {
         Err(e) => { state.status = e; return; }
     };
 
+    if !patch_zip.exists() {
+        state.status = format!("Error: Patch file does not exist: {}", patch_zip.display());
+        return;
+    }
+    if !patch_zip.is_file() {
+        state.status = format!(
+            "Error: Patch path must point to a .zip file: {}",
+            patch_zip.display()
+        );
+        return;
+    }
+
+    if let Err(e) = require_dir(&old, "Old version folder") {
+        state.status = e;
+        return;
+    }
+
+    if out.exists() && !out.is_dir() {
+        state.status = format!(
+            "Error: Output path exists and is not a folder: {}",
+            out.display()
+        );
+        return;
+    }
     if same_path(&old, &out) {
         state.status = "Error: Old Version and New Version (empty) folders must be different".into();
         return;
@@ -500,6 +541,11 @@ fn start_apply(state: &mut AppState) {
         "New version (empty) folder",
     ) {
         state.status = e;
+        return;
+    }
+
+    if let Err(e) = runner::validate_patch_zip(&patch_zip) {
+        state.status = format!("Error: {}", e);
         return;
     }
 
