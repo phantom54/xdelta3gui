@@ -48,6 +48,29 @@ pub fn ensure_xdelta_exe() -> Result<PathBuf, String> {
     Ok(xdelta_path)
 }
 
+pub fn validate_patch_zip(zip_path: &Path) -> Result<(), String> {
+    let f = std::fs::File::open(zip_path)
+        .map_err(|e| format!("Failed to open zip: {}", e))?;
+    let mut archive = ZipArchive::new(f)
+        .map_err(|e| format!("Invalid zip: {}", e))?;
+
+    let meta = read_meta_from_archive(&mut archive)?;
+    if meta.operations.is_empty() {
+        return Err("Patch metadata contains no operations (empty patch)".into());
+    }
+    Ok(())
+}
+
+fn read_meta_from_archive(archive: &mut ZipArchive<std::fs::File>) -> Result<PatchMeta, String> {
+    let mut f = archive
+        .by_name("xdelta_metainfo.json")
+        .map_err(|e| format!("meta not found in zip: {}", e))?;
+    let mut s = String::new();
+    f.read_to_string(&mut s)
+        .map_err(|e| format!("read meta: {}", e))?;
+    serde_json::from_str(&s).map_err(|e| format!("parse meta: {}", e))
+}
+
 fn check_exes(xdelta_exe: &Path) -> Result<(), String> {
     if !xdelta_exe.exists() {
         return Err(format!("Cannot find xdelta3.exe at: {}", xdelta_exe.display()));
@@ -292,6 +315,13 @@ pub fn create_patch_to_dir(
         return false;
     }
 
+    if meta.operations.is_empty() {
+        let _ = tx.send(ProgressMsg::Done(Err(
+            "Patch metadata contains no operations (empty patch)".into(),
+        )));
+        return false;
+    }
+
     let empty_src = match empty_source_path() {
         Ok(p) => p,
         Err(e) => {
@@ -430,6 +460,13 @@ pub fn create_patch(
     cancel_flag: Arc<AtomicBool>,
     current_pid: CurrentPid,
 ) {
+    if meta.operations.is_empty() {
+        let _ = tx.send(ProgressMsg::Done(Err(
+            "Patch metadata contains no operations (empty patch)".into(),
+        )));
+        return;
+    }
+
     let work_dir = temp_dir_for_zip(zip_path);
 
     let _ = std::fs::remove_dir_all(&work_dir);
@@ -514,30 +551,22 @@ pub fn apply_patch(
         }
     };
 
-    let meta: PatchMeta = {
-        let mut f = match archive.by_name("xdelta_metainfo.json") {
-            Ok(f) => f,
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&unpack_dir);
-                let _ = tx.send(ProgressMsg::Done(Err(format!("meta not found in zip: {}", e))));
-                return;
-            }
-        };
-        let mut s = String::new();
-        if let Err(e) = f.read_to_string(&mut s) {
+    let meta = match read_meta_from_archive(&mut archive) {
+        Ok(m) => m,
+        Err(e) => {
             let _ = std::fs::remove_dir_all(&unpack_dir);
-            let _ = tx.send(ProgressMsg::Done(Err(format!("read meta: {}", e))));
+            let _ = tx.send(ProgressMsg::Done(Err(e)));
             return;
         }
-        match serde_json::from_str(&s) {
-            Ok(m) => m,
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&unpack_dir);
-                let _ = tx.send(ProgressMsg::Done(Err(format!("parse meta: {}", e))));
-                return;
-            }
-        }
     };
+
+    if meta.operations.is_empty() {
+        let _ = std::fs::remove_dir_all(&unpack_dir);
+        let _ = tx.send(ProgressMsg::Done(Err(
+            "Patch metadata contains no operations (empty patch)".into(),
+        )));
+        return;
+    }
 
     let total_ops = meta.operations.len();
     let mut errors: Vec<FileError> = Vec::new();
